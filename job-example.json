@@ -1,0 +1,10 @@
+{
+  "inputs": ["Input/clip1.mp4", "Input/clip2.mp4"],
+  "output": "Output/final.mp4",
+  "resolution": "1920x1080",
+  "fps": 30,
+  "trim": {"start": "00:00:02", "end": "00:01:30"},
+  "subtitles": "Input/subs.srt",
+  "denoise_audio": true,
+  "normalize_audio": true
+}
