@@ -1,0 +1,43 @@
+name: Edit video
+
+on:
+  push:
+    paths: ['jobs/**']
+  workflow_dispatch:
+    inputs:
+      job:
+        description: 'Путь к файлу задания, например jobs/job-001.json'
+        required: true
+
+jobs:
+  edit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Install ffmpeg and rclone
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+
+      - name: Configure rclone
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+
+      - name: Run jobs
+        env:
+          JOB: ${{ github.event.inputs.job }}
+        run: |
+          if [ -n "$JOB" ]; then
+            FILES="$JOB"
+          else
+            FILES=$(git diff --name-only --diff-filter=AM HEAD~1 HEAD -- 'jobs/*.json' || true)
+          fi
+          python3 scripts/edit.py $FILES
