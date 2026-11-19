@@ -1,0 +1,5 @@
+{
+  "inputs": ["Input/test.mp4"],
+  "output": "Output/test_out.mp4",
+  "trim": {"start": "00:00:00", "end": "00:00:10"}
+}
