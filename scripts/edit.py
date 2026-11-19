@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Монтаж по файлу задания: скачивает видео с Google Drive, монтирует ffmpeg, загружает результат обратно."""
+"""Монтаж по заданиям: из файлов jobs/*.json в репозитории и/или из папки Jobs на Google Drive."""
 import json
 import os
 import pathlib
@@ -79,10 +79,53 @@ def process(job_file):
     print(f"Готово: {job['output']}")
 
 
+def drive_job_names():
+    r = subprocess.run(
+        ["rclone", "lsf", f"{REMOTE}:Jobs", "--files-only", "--include", "*.json"],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        print("Папка Jobs недоступна:", r.stderr.strip())
+        return []
+    return [n.strip() for n in r.stdout.splitlines() if n.strip()]
+
+
+def poll_drive():
+    names = drive_job_names()
+    if not names:
+        print("Новых заданий на Диске нет.")
+        return 0
+    failed = 0
+    for name in names:
+        local = pathlib.Path(tempfile.mkdtemp()) / name
+        run(["rclone", "copyto", f"{REMOTE}:Jobs/{name}", local])
+        # сразу убираем задание из очереди, чтобы следующий запуск не взял его повторно
+        run(["rclone", "moveto", f"{REMOTE}:Jobs/{name}", f"{REMOTE}:Jobs/Processing/{name}"])
+        try:
+            process(local)
+            dest = "Done"
+        except Exception as e:
+            print("ОШИБКА:", e, flush=True)
+            failed += 1
+            dest = "Failed"
+            subprocess.run(["rclone", "rcat", f"{REMOTE}:Jobs/Failed/{name}.error.txt"],
+                           input=str(e).encode("utf-8"))
+        run(["rclone", "moveto", f"{REMOTE}:Jobs/Processing/{name}", f"{REMOTE}:Jobs/{dest}/{name}"])
+    return failed
+
+
 if __name__ == "__main__":
-    files = sys.argv[1:]
-    if not files:
-        print("Нет заданий для выполнения.")
-        sys.exit(0)
+    args = sys.argv[1:]
+    use_drive = "--drive" in args
+    files = [a for a in args if a != "--drive"]
+    failed = 0
     for f in files:
-        process(f)
+        try:
+            process(f)
+        except Exception as e:
+            print("ОШИБКА:", e, flush=True)
+            failed += 1
+    if use_drive:
+        failed += poll_drive()
+    if not files and not use_drive:
+        print("Нет заданий для выполнения.")
+    sys.exit(1 if failed else 0)
