@@ -1,13 +1,19 @@
 name: Edit video
 
 on:
+  schedule:
+    - cron: '*/30 * * * *'
   push:
     paths: ['jobs/**']
   workflow_dispatch:
     inputs:
       job:
-        description: 'Путь к файлу задания, например jobs/job-001.json'
-        required: true
+        description: 'Необязательно: путь к файлу задания в репозитории'
+        required: false
+
+concurrency:
+  group: edit-video
+  cancel-in-progress: false
 
 jobs:
   edit:
@@ -34,10 +40,11 @@ jobs:
       - name: Run jobs
         env:
           JOB: ${{ github.event.inputs.job }}
+          EVENT: ${{ github.event_name }}
         run: |
-          if [ -n "$JOB" ]; then
-            FILES="$JOB"
-          else
+          FILES=""
+          if [ "$EVENT" = "push" ]; then
             FILES=$(git diff --name-only --diff-filter=AM HEAD~1 HEAD -- 'jobs/*.json' || true)
           fi
-          python3 scripts/edit.py $FILES
+          if [ -n "$JOB" ]; then FILES="$JOB"; fi
+          python3 scripts/edit.py --drive $FILES
