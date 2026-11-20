@@ -10,6 +10,7 @@
   subtitles "Input/x.srt"   - готовые субтитры с Диска
   denoise_audio, normalize_audio, preset, crf, fps, extra_args
 """
+import importlib
 import json
 import os
 import pathlib
@@ -46,11 +47,45 @@ def probe(path):
     return w, h, float(d["format"]["duration"])
 
 
+def audio_levels(path):
+    """Громкость звука по окнам 50 мс (RMS, дБ)."""
+    r = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostats", "-i", str(path), "-vn", "-ac", "1", "-af",
+         "aresample=16000,asetnsamples=n=800:p=0,astats=metadata=1:reset=1,"
+         "ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-",
+         "-f", "null", "-"],
+        capture_output=True, text=True)
+    vals = []
+    for m in re.finditer(r"lavfi\.astats\.Overall\.RMS_level=(\S+)", r.stdout):
+        try:
+            v = float(m.group(1))
+        except ValueError:
+            v = -90.0
+        vals.append(max(v, -90.0))
+    return vals
+
+
+def auto_threshold(path):
+    """Порог тишины подбирается по самому видео: между фоновым шумом и громкостью речи."""
+    vals = sorted(audio_levels(path))
+    if len(vals) < 20:
+        print("Мало данных о звуке, порог -32 дБ", flush=True)
+        return -32.0
+    noise = vals[int(len(vals) * 0.05)]
+    speech = vals[int(len(vals) * 0.90)]
+    thr = -32.0 if speech - noise < 8 else noise + 0.45 * (speech - noise)
+    thr = max(-55.0, min(-22.0, thr))
+    print(f"Звук: фон {noise:.1f} дБ, речь {speech:.1f} дБ, порог тишины {thr:.1f} дБ", flush=True)
+    return thr
+
+
 def speech_segments(path, duration, cfg):
     """Находит участки с речью. Паузы длиннее min_silence вырезаются, по краям речи остаётся pad секунд."""
-    thr = cfg.get("threshold_db", -32)
-    min_sil = cfg.get("min_silence", 0.6)
-    pad = cfg.get("pad", 0.15)
+    thr = cfg.get("threshold_db", "auto")
+    if thr == "auto":
+        thr = auto_threshold(path)
+    min_sil = cfg.get("min_silence", 0.4)
+    pad = cfg.get("pad", 0.1)
     r = subprocess.run(
         ["ffmpeg", "-hide_banner", "-nostats", "-i", str(path), "-vn",
          "-af", f"silencedetect=noise={thr}dB:d={min_sil}", "-f", "null", "-"],
@@ -59,6 +94,7 @@ def speech_segments(path, duration, cfg):
     ends = [float(x) for x in re.findall(r"silence_end: ([\d.]+)", r.stderr)]
     if len(starts) > len(ends):
         ends.append(duration)
+    print(f"Найдено пауз: {len(starts)}", flush=True)
     speech, cur = [], 0.0
     for s, e in zip(starts, ends):
         if s > cur:
@@ -93,12 +129,23 @@ def cut_graph(segs, with_video):
 
 # ---------- субтитры ----------
 
-def transcribe(wav, language, model_name):
+def ensure_whisper():
     try:
         from faster_whisper import WhisperModel
+        return WhisperModel
     except ImportError:
-        run([sys.executable, "-m", "pip", "install", "-q", "faster-whisper"])
-        from faster_whisper import WhisperModel
+        pass
+    target = "/tmp/pydeps"
+    spec = os.environ.get("WHISPER_PIP_SPEC", "faster-whisper")
+    run([sys.executable, "-m", "pip", "install", "--quiet", "--target", target, spec])
+    sys.path.insert(0, target)
+    importlib.invalidate_caches()
+    from faster_whisper import WhisperModel
+    return WhisperModel
+
+
+def transcribe(wav, language, model_name):
+    WhisperModel = ensure_whisper()
     model = WhisperModel(model_name, device="cpu", compute_type="int8")
     segments, info = model.transcribe(str(wav), language=language, vad_filter=True,
                                       word_timestamps=True, beam_size=5)
