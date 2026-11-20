@@ -24,10 +24,14 @@ jobs:
         with:
           fetch-depth: 2
 
-      - name: Install ffmpeg and rclone
+      - name: Install ffmpeg, fonts and rclone
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          for i in 1 2 3; do
+            sudo apt-get update && sudo apt-get install -y --fix-missing -o Acquire::Retries=3 ffmpeg fonts-dejavu-core && break
+            echo "apt не сработал, попытка $i, жду 20 секунд"
+            sleep 20
+          done
+          command -v ffmpeg || { echo "ffmpeg не установился"; exit 1; }
           curl -fsSL https://rclone.org/install.sh | sudo bash
 
       - name: Configure rclone
