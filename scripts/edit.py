@@ -136,8 +136,8 @@ def ensure_whisper():
     except ImportError:
         pass
     target = "/tmp/pydeps"
-    spec = os.environ.get("WHISPER_PIP_SPEC", "faster-whisper")
-    run([sys.executable, "-m", "pip", "install", "--quiet", "--target", target, spec])
+    specs = os.environ.get("WHISPER_PIP_SPEC", "faster-whisper av<19").split()
+    run([sys.executable, "-m", "pip", "install", "--quiet", "--target", target] + specs)
     sys.path.insert(0, target)
     importlib.invalidate_caches()
     from faster_whisper import WhisperModel
@@ -146,9 +146,14 @@ def ensure_whisper():
 
 def transcribe(wav, language, model_name):
     WhisperModel = ensure_whisper()
+    import wave
+    import numpy as np
+    with wave.open(str(wav), "rb") as wf:
+        audio = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float32) / 32768.0
     model = WhisperModel(model_name, device="cpu", compute_type="int8")
-    segments, info = model.transcribe(str(wav), language=language, vad_filter=True,
-                                      word_timestamps=True, beam_size=5)
+    segments, info = model.transcribe(audio, language=language, vad_filter=True,
+                                      word_timestamps=True, beam_size=5,
+                                      condition_on_previous_text=False)
     words = []
     for seg in segments:
         for w in (seg.words or []):
@@ -159,6 +164,44 @@ def transcribe(wav, language, model_name):
     return words
 
 
+def segments_from_words(words, duration, min_silence, pad):
+    """Куски с речью по словам: пауза между словами >= min_silence вырезается, по краям остаётся pad."""
+    groups = []
+    for s_, e_, _ in words:
+        s_, e_ = min(s_, duration), min(e_, duration)
+        if groups and s_ - groups[-1][1] < min_silence:
+            groups[-1][1] = max(groups[-1][1], e_)
+        else:
+            groups.append([s_, e_])
+    segs = []
+    for a_, b_ in groups:
+        a_, b_ = max(0.0, a_ - pad), min(duration, b_ + pad)
+        if segs and a_ <= segs[-1][1]:
+            segs[-1] = (segs[-1][0], max(segs[-1][1], b_))
+        else:
+            segs.append((a_, b_))
+    kept = sum(b_ - a_ for a_, b_ in segs)
+    print(f"Резка по речи: оставлено {kept:.1f} с из {duration:.1f} с, кусков: {len(segs)}", flush=True)
+    return segs
+
+
+def remap_words(words, segs):
+    """Переносит время слов на шкалу видео после вырезания пауз."""
+    offsets, acc = [], 0.0
+    for a_, b_ in segs:
+        offsets.append(acc)
+        acc += b_ - a_
+    out = []
+    for s_, e_, t in words:
+        for idx, ((a_, b_), off) in enumerate(zip(segs, offsets)):
+            if a_ - 1e-6 <= s_ <= b_ + 1e-6:
+                ns = off + (s_ - a_)
+                ne = off + (min(e_, b_) - a_)
+                out.append((ns, max(ne, ns + 0.05), t, idx))
+                break
+    return out
+
+
 def build_chunks(words, max_chars, max_words=7, max_dur=3.2, max_gap=0.6):
     chunks, cur = [], []
     for w in words:
@@ -167,7 +210,8 @@ def build_chunks(words, max_chars, max_words=7, max_dur=3.2, max_gap=0.6):
             too_long = len(text) + 1 + len(w[2]) > max_chars or len(cur) >= max_words
             too_slow = w[1] - cur[0][0] > max_dur or w[0] - cur[-1][1] > max_gap
             ends_sentence = text.endswith((".", "?", "!", "…"))
-            if too_long or too_slow or ends_sentence:
+            seg_change = len(w) > 3 and len(cur[-1]) > 3 and w[3] != cur[-1][3]
+            if too_long or too_slow or ends_sentence or seg_change:
                 chunks.append(cur)
                 cur = []
         cur.append(w)
@@ -207,6 +251,14 @@ def subtitle_filter(w, h):
 
 # ---------- основной монтаж ----------
 
+def extract_wav(src, dst, graph_file=None):
+    cmd = ["ffmpeg", "-y", "-i", src]
+    if graph_file:
+        cmd += ["-filter_complex_script", graph_file, "-map", "[ac]"]
+    cmd += ["-vn", "-ac", "1", "-ar", "16000", dst]
+    run(cmd)
+
+
 def process(job_file):
     job = json.loads(pathlib.Path(job_file).read_text(encoding="utf-8"))
     work = pathlib.Path(tempfile.mkdtemp())
@@ -218,25 +270,21 @@ def process(job_file):
         inputs.append(dst)
     n = len(inputs)
 
-    cut_cfg = job.get("cut_silence")
-    auto_cfg = job.get("auto_subtitles")
-    if cut_cfg and n != 1:
-        raise ValueError("cut_silence работает только с одним входным видео")
-    if auto_cfg and n != 1:
-        raise ValueError("auto_subtitles работает только с одним входным видео")
-    if cut_cfg is True:
-        cut_cfg = {}
-    if auto_cfg is True:
-        auto_cfg = {}
+    cut_cfg, auto_cfg = job.get("cut_silence"), job.get("auto_subtitles")
+    cut_on = cut_cfg not in (None, False)
+    auto_on = auto_cfg not in (None, False)
+    cut_cfg = cut_cfg if isinstance(cut_cfg, dict) else {}
+    auto_cfg = auto_cfg if isinstance(auto_cfg, dict) else {}
+    if (cut_on or auto_on) and n != 1:
+        raise ValueError("cut_silence и auto_subtitles работают только с одним входным видео")
 
     w, h = (job.get("resolution") or "1920x1080").split("x")
     fps = int(job.get("fps", 30))
     fit = (f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1")
 
-    parts = []
-    vf, af = [], []
-    segs = None
+    parts, vf, af = [], [], []
+    words = None  # слова на временной шкале итогового видео
 
     if n > 1:
         for i in range(n):
@@ -244,38 +292,64 @@ def process(job_file):
             parts.append(f"[{i}:a]aresample=48000,aformat=channel_layouts=stereo[a{i}]")
         parts.append("".join(f"[v{i}][a{i}]" for i in range(n)) + f"concat=n={n}:v=1:a=1[vc][ac]")
         vin, ain = "vc", "ac"
-    elif cut_cfg is not None and cut_cfg is not False:
-        src_w, src_h, duration = probe(inputs[0])
-        segs = speech_segments(inputs[0], duration, cut_cfg)
-        parts += cut_graph(segs, True)
-        vin, ain = "vc", "ac"
-        if job.get("resolution"):
-            vf.append(fit)
-    else:
-        vin, ain = "0:v", "0:a"
-        if job.get("resolution"):
-            vf.append(fit)
-
-    # размеры итогового кадра (нужны для оформления субтитров)
-    if job.get("resolution"):
         out_w, out_h = int(w), int(h)
     else:
-        out_w, out_h, _ = probe(inputs[0])
+        vin, ain = "0:v", "0:a"
+        src_w, src_h, duration = probe(inputs[0])
+        out_w, out_h = (int(w), int(h)) if job.get("resolution") else (src_w, src_h)
 
-    if auto_cfg is not None and auto_cfg is not False:
-        wav = work / "speech.wav"
+        method = cut_cfg.get("method", "words" if auto_on else "energy")
+        by_words = method == "words"
+        min_sil = cut_cfg.get("min_silence", 0.45 if by_words else 0.4)
+        pad = cut_cfg.get("pad", 0.12 if by_words else 0.1)
+        language = auto_cfg.get("language", "ru")
+        model_name = auto_cfg.get("model", "small")
+
+        orig_words = None
+        if auto_on and (not cut_on or by_words):
+            wav = work / "speech.wav"
+            extract_wav(inputs[0], wav)
+            orig_words = transcribe(wav, language, model_name)
+
+        segs = None
+        if cut_on:
+            if by_words and orig_words:
+                segs = segments_from_words(orig_words, duration, min_sil, pad)
+            else:
+                if by_words:
+                    print("Слов не найдено, режу по громкости", flush=True)
+                energy_cfg = {k: v for k, v in cut_cfg.items() if k != "method"}
+                energy_cfg.setdefault("min_silence", min_sil)
+                energy_cfg.setdefault("pad", pad)
+                segs = speech_segments(inputs[0], duration, energy_cfg)
         if segs:
-            graph = work / "audio_graph.txt"
-            graph.write_text(";\n".join(cut_graph(segs, False)), encoding="utf-8")
-            run(["ffmpeg", "-y", "-i", inputs[0], "-filter_complex_script", graph,
-                 "-map", "[ac]", "-vn", "-ac", "1", "-ar", "16000", wav])
+            parts += cut_graph(segs, True)
+            vin, ain = "vc", "ac"
+
+        if auto_on:
+            if orig_words is not None:
+                words = remap_words(orig_words, segs) if segs else orig_words
+            else:
+                wav = work / "speech.wav"
+                if segs:
+                    graph = work / "audio_graph.txt"
+                    graph.write_text(";\n".join(cut_graph(segs, False)), encoding="utf-8")
+                    extract_wav(inputs[0], wav, graph)
+                else:
+                    extract_wav(inputs[0], wav)
+                words = transcribe(wav, language, model_name)
+
+    if n == 1 and job.get("resolution"):
+        vf.append(fit)
+
+    if auto_on:
+        if words:
+            chunks = build_chunks(words, 26 if out_h > out_w else 40)
+            write_srt(chunks, work / "subs.srt")
+            print(f"Субтитров: {len(chunks)}", flush=True)
+            vf.append(subtitle_filter(out_w, out_h))
         else:
-            run(["ffmpeg", "-y", "-i", inputs[0], "-vn", "-ac", "1", "-ar", "16000", wav])
-        words = transcribe(wav, auto_cfg.get("language", "ru"), auto_cfg.get("model", "small"))
-        max_chars = 26 if out_h > out_w else 40
-        chunks = build_chunks(words, max_chars)
-        write_srt(chunks, work / "subs.srt")
-        vf.append(subtitle_filter(out_w, out_h))
+            print("Слов не найдено: субтитры не добавлены", flush=True)
     elif job.get("subtitles"):
         run(["rclone", "copyto", f"{REMOTE}:{job['subtitles']}", work / "subs.srt"])
         vf.append("subtitles=subs.srt")
